@@ -156,6 +156,13 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
     private _lastPauseState: { expecting: ReasonType; event: Crdp.Debugger.PausedEvent };
 
+    private _originalFileOrUrl: string;
+
+    // Break on load: Store some mapping between the requested file names, the regex for the file, and the chrome breakpoint id to perform lookup operations efficiently
+    private _stopOnEntryBreakpointIdToRequestedFileName = new Map<string, [string, Set<string>]>();
+    private _stopOnEntryRequestedFileNameToBreakpointId = new Map<string, string>();
+    private _stopOnEntryRegexToBreakpointId = new Map<string, string>();
+
     public constructor({ chromeConnection, lineColTransformer, sourceMapTransformer, pathTransformer, targetFilter, enableSourceMapCaching }: IChromeDebugAdapterOpts, session: ChromeDebugSession) {
         telemetry.setupEventHandler(e => session.sendEvent(e));
         this._session = session;
@@ -245,11 +252,27 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
     }
 
     public configurationDone(): Promise<void> {
+        // This means all the setBreakpoints requests have been completed. So we can navigate to the original file/url.
+        logger.log("NAVIGATION OCCURED");
+        this.chrome.Page.navigate({url: this._originalFileOrUrl});
         return Promise.resolve();
     }
 
     public launch(args: ILaunchRequestArgs): Promise<void> {
         this.commonArgs(args);
+
+        // We store the launch file/url provided and temporarily launch and attach to about:blank page. Once we receive configurationDone() event, we redirect the page to this file/url
+        // This is done to facilitate hitting breakpoints on load
+        if (args["file"]) {
+            this._originalFileOrUrl = args["file"];
+            args["file"] = "";
+            args["url"] = "about:blank";
+        }
+        else if(args["url"]) {
+            this._originalFileOrUrl = args["url"];
+            args["url"] = "about:blank";
+        }
+
         this._sourceMapTransformer.launch(args);
         this._pathTransformer.launch(args);
 
@@ -447,6 +470,10 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
         // breakpoint. If not set, assume it was a step. We can't tell the difference between step and 'break on anything'.
         let reason: ReasonType;
         let smartStepP = Promise.resolve(false);
+
+        logger.log("NOTIFICATION = " + JSON.stringify(notification));
+        logger.log("StopReason = " + expectingStopReason);
+
         if (notification.reason === 'exception') {
             reason = 'exception';
             this._exception = notification.data;
@@ -463,6 +490,43 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
             this._exception = notification.data;
         } else if (notification.hitBreakpoints && notification.hitBreakpoints.length) {
             reason = 'breakpoint';
+
+            const hitBreakpoints = notification.hitBreakpoints;
+
+            if (hitBreakpoints.length === 1) {
+                // If it's a single breakpoint and it is a breakonload breakpoint
+                if (this._stopOnEntryBreakpointIdToRequestedFileName.has(hitBreakpoints[0])) {
+
+                    // Get the mapped url of the file where execution is paused
+                    const pausedScriptId = notification.callFrames[0].location.scriptId;
+                    const pausedScriptUrl = this._scriptsById.get(pausedScriptId).url;
+
+                    const mappedUrl = this._pathTransformer.scriptParsed(pausedScriptUrl);
+                    const normalizedMappedUrl = path.normalize(mappedUrl);
+
+                    logger.log("MAPPED URL = " + normalizedMappedUrl);
+
+                    // If the file has unbound breakpoints, make sure to resolve them first and then continue
+                    if (this._pendingBreakpointsByUrl.has(normalizedMappedUrl)) {
+                        this.resolvePendingBreakpoint(this._pendingBreakpointsByUrl.get(normalizedMappedUrl))
+                        .then(() => {
+                            this._pendingBreakpointsByUrl.delete(normalizedMappedUrl);
+                            logger.log("BREAKPOINTS RESOLVED. BREAKONLOAD BREAKPOINT CONTINUE");
+                            this.chrome.Debugger.resume()
+                                .catch(e => { });
+                        });
+                    } else {
+                        logger.log("BREAKONLOAD BREAKPOINT CONTINUE");
+                        this.chrome.Debugger.resume()
+                            .catch(e => { });
+                    }
+
+                    return;
+                }
+            }
+            else {
+                //
+            }
 
             // Did we hit a hit condition breakpoint?
             for (let hitBp of notification.hitBreakpoints) {
@@ -597,25 +661,32 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
         const resolvePendingBPs = (source: string) => {
             source = source && this.fixPathCasing(source);
-            if (this._pendingBreakpointsByUrl.has(source)) {
-                this.resolvePendingBreakpoint(this._pendingBreakpointsByUrl.get(source))
-                    .then(() => this._pendingBreakpointsByUrl.delete(source));
+            const normalizedSource = path.normalize(source);
+
+            if (this._pendingBreakpointsByUrl.has(normalizedSource)) {
+                this.resolvePendingBreakpoint(this._pendingBreakpointsByUrl.get(normalizedSource))
+                    .then(() => this._pendingBreakpointsByUrl.delete(normalizedSource));
             }
         };
 
         const mappedUrl = this._pathTransformer.scriptParsed(script.url);
+        const normalizedMappedUrl = path.normalize(mappedUrl);
+
         const sourceMapsP = this._sourceMapTransformer.scriptParsed(mappedUrl, script.sourceMapURL).then(sources => {
             if (sources) {
+                // Do we need to skip calling resolve for these?
                 sources
                     .filter(source => source !== mappedUrl) // Tools like babel-register will produce sources with the same path as the generated script
                     .forEach(resolvePendingBPs);
             }
 
-            if (script.url === mappedUrl && this._pendingBreakpointsByUrl.has(mappedUrl) && this._pendingBreakpointsByUrl.get(mappedUrl).bpsSet) {
+            if (script.url === mappedUrl && this._pendingBreakpointsByUrl.has(normalizedMappedUrl) && this._pendingBreakpointsByUrl.get(normalizedMappedUrl).bpsSet) {
                 // If the pathTransformer had no effect, and we attempted to set the BPs with that path earlier, then assume that they are about
                 // to be resolved in this loaded script, and remove the pendingBP.
-                this._pendingBreakpointsByUrl.delete(mappedUrl);
-            } else {
+                this._pendingBreakpointsByUrl.delete(normalizedMappedUrl);
+            }
+            // Only call the resolvePendingBreakpoint function for files where we do not set break on load breakpoints. For those files, it is called from onPaused function.
+            else if (!this._stopOnEntryRequestedFileNameToBreakpointId.has(path.normalize(normalizedMappedUrl))) {
                 resolvePendingBPs(mappedUrl);
             }
 
@@ -845,6 +916,7 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
     }
 
     private resolvePendingBreakpoint(pendingBP: IPendingBreakpoint): Promise<void> {
+        logger.log("RESOLVE PENDING CALLED");
         return this.setBreakpoints(pendingBP.args, pendingBP.requestSeq, pendingBP.ids).then(response => {
             response.breakpoints.forEach((bp, i) => {
                 bp.id = pendingBP.ids[i];
@@ -871,9 +943,10 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
             column: params.location.columnNumber
         };
         const scriptPath = this._pathTransformer.breakpointResolved(bp, script.url);
-        if (this._pendingBreakpointsByUrl.has(scriptPath)) {
-            // If we set these BPs before the script was loaded, remove from the pending list
-            this._pendingBreakpointsByUrl.delete(scriptPath);
+        const normalizedScriptPath = path.normalize(scriptPath);
+        if (this._pendingBreakpointsByUrl.has(normalizedScriptPath) && !this._stopOnEntryRequestedFileNameToBreakpointId.has(normalizedScriptPath)) {
+            // If we set these BPs before the script was loaded and the script isn't a break on load script, remove from the pending list
+            this._pendingBreakpointsByUrl.delete(normalizedScriptPath);
         }
         this._sourceMapTransformer.breakpointResolved(bp, scriptPath);
         this._lineColTransformer.breakpointResolved(bp);
@@ -980,6 +1053,7 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
         return this.validateBreakpointsPath(args)
             .then(() => {
+                logger.log("VALIDATED");
                 this._lineColTransformer.setBreakpoints(args);
                 this._sourceMapTransformer.setBreakpoints(args, requestSeq);
                 this._pathTransformer.setBreakpoints(args);
@@ -1025,7 +1099,7 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
                         if (body.breakpoints.every(bp => !bp.verified)) {
                             return this.unverifiedBpResponseForBreakpoints(args, requestSeq, body.breakpoints, localize('bp.fail.unbound', "Breakpoints set but not yet bound"), true);
                         }
-
+                        logger.log("CHECK HERE BODY = " + JSON.stringify(body));
                         this._sourceMapTransformer.setBreakpointsResponse(body, requestSeq);
                         this._lineColTransformer.setBreakpointsResponse(body);
                         return body;
@@ -1050,14 +1124,14 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
         if (!args.source.path || args.source.sourceReference) return Promise.resolve();
 
         return this._sourceMapTransformer.getGeneratedPathFromAuthoredPath(args.source.path).then<void>(mappedPath => {
-            if (!mappedPath) {
+            /*if (!mappedPath) {
                 return utils.errP(localize('validateBP.sourcemapFail', "Breakpoint ignored because generated code not found (source map problem?)."));
             }
 
             const targetPath = this._pathTransformer.getTargetPathFromClientPath(mappedPath);
             if (!targetPath) {
                 return utils.errP(localize('validateBP.notFound', "Breakpoint ignored because target path not found"));
-            }
+            }*/
 
             return undefined;
         });
@@ -1086,7 +1160,10 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
         if (args.source.path) {
             const ids = breakpoints.map(bp => bp.id);
-            this._pendingBreakpointsByUrl.set(this.fixPathCasing(args.source.path), { args, ids, requestSeq, bpsSet });
+            logger.log("Putting IDs as pending " + ids.toString());
+            logger.log("ARGS = " + JSON.stringify(args));
+            logger.log("SETTING FOR = " + path.normalize(this.fixPathCasing(args.source.path)));
+            this._pendingBreakpointsByUrl.set(path.normalize(this.fixPathCasing(args.source.path)), { args, ids, requestSeq, bpsSet });
         }
 
         return { breakpoints };
@@ -1113,7 +1190,9 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
      * Responses from setBreakpointByUrl are transformed to look like the response from setBreakpoint, so they can be
      * handled the same.
      */
-    protected addBreakpoints(url: string, breakpoints: DebugProtocol.SourceBreakpoint[]): Promise<ISetBreakpointResult[]> {
+    protected async addBreakpoints(url: string, breakpoints: DebugProtocol.SourceBreakpoint[]): Promise<ISetBreakpointResult[]> {
+        logger.log("URL = " + url);
+        logger.log("BREAKPOINTS = " + JSON.stringify(breakpoints));
         let responsePs: Promise<ISetBreakpointResult>[];
         if (this.isEvalScript(url)) {
             // eval script with no real url - use debugger_setBreakpoint
@@ -1124,14 +1203,95 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
             // after refreshing the page. This is the only way to allow hitting breakpoints in code that runs immediately when
             // the page loads.
             const script = this.getScriptByUrl(url);
-            const urlRegex = utils.pathToRegex(url, this._caseSensitivePaths);
-            responsePs = breakpoints.map(({ line, column = 0, condition }, i) => {
-                return this.addOneBreakpointByUrl(script && script.scriptId, urlRegex, line, column, condition);
-            });
+            logger.log("script = " + JSON.stringify(script));
+
+            // If script has been parsed, script object won't be undefined and we would have the mapping file on the disk and we can directly set breakpoint using that
+            if (script !== undefined) {
+                const urlRegex = utils.pathToRegex(url, this._caseSensitivePaths);
+                logger.log("urlregex = " + JSON.stringify(urlRegex));
+                responsePs = breakpoints.map(({ line, column = 0, condition }, i) => {
+                    return this.addOneBreakpointByUrl(script && script.scriptId, urlRegex, line, column, condition);
+                });
+            }
+            // Else if script hasn't been parsed, we set a break on load breakpoint on the scripts which match the regex we generate based on the url
+            else {
+
+                // Get the normalized filename for accurate comparisons
+                const normalizedFileName = path.normalize(url);
+
+                // Check if file already has a stop on entry breakpoint
+                if(!this._stopOnEntryRequestedFileNameToBreakpointId.has(normalizedFileName)) {
+
+                    // Generate regex we need for the file
+                    const urlRegex = this.getUrlRegexForBreakOnLoad(url);
+
+                    logger.log("urlregex = " + JSON.stringify(urlRegex));
+
+                    // Check if we already have a breakpoint for this regexp since two different files like script.ts and script.js may have the same regexp
+                    let breakpointId: string;
+                    breakpointId = this._stopOnEntryRegexToBreakpointId.get(urlRegex);
+
+                    // If breakpointId is undefined it means the breakpoint doesn't exist yet so we add it
+                    if (breakpointId === undefined) {
+                        let result;
+                        try {
+                            logger.log("TRYING TO SET STOP ON ENTRY BREAKPOINT");
+                            result = await this.setStopOnEntryBreakpoint(urlRegex);
+                        } catch (e) {
+                            logger.log(`Exception occured while trying to set stop on entry breakpoint ${e.message}.`);
+                        }
+                        breakpointId = result.breakpointId;
+                        logger.log("Stop on entry result = " + JSON.stringify(result));
+                        if (breakpointId) {
+                            this._stopOnEntryRegexToBreakpointId.set(urlRegex, breakpointId);
+                        }
+                        else {
+                            logger.log(`BreakpointId was null when trying to set on urlregex ${urlRegex}. This normally happens if the breakpoint already exists.`);
+                        }
+                        responsePs = [result];
+                    }
+                    else{
+                        responsePs = [];
+                    }
+
+                    // Store the new breakpointId and the file name in the right mappings
+                    this._stopOnEntryRequestedFileNameToBreakpointId.set(normalizedFileName, breakpointId);
+
+                    let regexAndFileNames = this._stopOnEntryBreakpointIdToRequestedFileName.get(breakpointId);
+
+                    // If there already exists an entry for the breakpoint Id, we add this file to the list of file mappings
+                    if (regexAndFileNames !== undefined) {
+                        regexAndFileNames[1].add(normalizedFileName);
+                    }
+                    // else create an entry for this breakpoint id
+                    else {
+                        const fileSet = new Set<string>();
+                        fileSet.add(normalizedFileName);
+                        this._stopOnEntryBreakpointIdToRequestedFileName.set(breakpointId, [urlRegex, fileSet]);
+                    }
+                }
+                else {
+                    responsePs = [];
+                }
+            }
+
         }
 
         // Join all setBreakpoint requests to a single promise
         return Promise.all(responsePs);
+    }
+
+    private async setStopOnEntryBreakpoint(urlRegex: string): Promise<Crdp.Debugger.SetBreakpointByUrlResponse> {
+        let result = await this.chrome.Debugger.setBreakpointByUrl({ urlRegex, lineNumber: 0, columnNumber: 0, condition: '' });
+        return result;
+    }
+
+    private getUrlRegexForBreakOnLoad(url: string) {
+        const fileNameWithoutFullPath = path.parse(url).base;
+        const fileNameWithoutExtension = path.parse(fileNameWithoutFullPath).name;
+        const escapedFileName = fileNameWithoutExtension.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+
+        return ".*[\\\\\\/]" + escapedFileName + "([^A-z].*)?$";
     }
 
     private async addOneBreakpointByUrl(scriptId: Crdp.Runtime.ScriptId | undefined, urlRegex: string, lineNumber: number, columnNumber: number, condition: string): Promise<ISetBreakpointResult> {
@@ -1153,6 +1313,7 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
         let result;
         try {
+            logger.log("TRYING TO SET BREAKPOINT");
             result = await this.chrome.Debugger.setBreakpointByUrl({ urlRegex, lineNumber: bpLocation.lineNumber, columnNumber: bpLocation.columnNumber, condition });
         } catch (e) {
             if (e.message === "Breakpoint at specified location already exists.") {
@@ -1166,6 +1327,7 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
 
         // Now convert the response to a SetBreakpointResponse so both response types can be handled the same
         const locations = result.locations;
+        logger.log("LOCATIONS = " + JSON.stringify(locations));
         return <Crdp.Debugger.SetBreakpointResponse>{
             breakpointId: result.breakpointId,
             actualLocation: locations[0] && {
