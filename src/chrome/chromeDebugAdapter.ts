@@ -80,7 +80,8 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
     private static THREAD_ID = 1;
     private static SET_BREAKPOINTS_TIMEOUT = 5000;
     private static HITCONDITION_MATCHER = /^(>|>=|=|<|<=|%)?\s*([0-9]+)$/;
-    private static ASYNC_CALL_STACK_DEPTH = 4;
+    // Not applicable to Edge
+    //private static ASYNC_CALL_STACK_DEPTH = 4;
 
     protected _session: ChromeDebugSession;
     protected _domains = new Map<CrdpDomain, Crdp.Schema.Domain>();
@@ -356,8 +357,9 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
         this.chrome.Debugger.onScriptParsed(params => this.onScriptParsed(params));
         this.chrome.Debugger.onBreakpointResolved(params => this.onBreakpointResolved(params));
 
-        this.chrome.Console.onMessageAdded(params => this.onMessageAdded(params));
-        this.chrome.Runtime.onConsoleAPICalled(params => this.onConsoleAPICalled(params));
+        // No Console in Edge
+        //this.chrome.Console.onMessageAdded(params => this.onMessageAdded(params));
+        //this.chrome.Runtime.onConsoleAPICalled(params => this.onConsoleAPICalled(params));
         this.chrome.Runtime.onExceptionThrown(params => this.onExceptionThrown(params));
         this.chrome.Runtime.onExecutionContextsCleared(() => this.onExecutionContextsCleared());
 
@@ -369,11 +371,13 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
      */
     protected runConnection(): Promise<void>[] {
         return [
-            this.chrome.Console.enable()
-                .catch(e => { /* Specifically ignore a fail here since it's only for backcompat */ }),
+            // No console in Edge
+            //this.chrome.Console.enable()
+                //.catch(e => { /* Specifically ignore a fail here since it's only for backcompat */ }),
             utils.toVoidP(this.chrome.Debugger.enable()),
-            this.chrome.Runtime.enable(),
-            this._chromeConnection.run()
+            this.chrome.Runtime.enable()
+            // Not needed for Edge
+            //this._chromeConnection.run()
         ];
     }
 
@@ -409,21 +413,24 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
                 patterns = patterns.concat(this._launchAttachArgs.skipFileRegExps);
             }
 
+            // Make sure debugging domain is enabled before calling refreshBlackboxPatterns() below
+            // This works somehow in Chrome but errors out in Edge
+            await Promise.all(this.runConnection());
+
             if (patterns.length) {
                 this._blackboxedRegexes = patterns.map(pattern => new RegExp(pattern, 'i'));
                 this.refreshBlackboxPatterns();
             }
 
-            await Promise.all(this.runConnection());
             await this.initSupportedDomains();
-
-            const maxDepth = this._launchAttachArgs.showAsyncStacks ? ChromeDebugAdapter.ASYNC_CALL_STACK_DEPTH : 0;
+            // Edge doesn't support Async_call_stack_depth
+            /*const maxDepth = this._launchAttachArgs.showAsyncStacks ? ChromeDebugAdapter.ASYNC_CALL_STACK_DEPTH : 0;
             try {
                 return await this.chrome.Debugger.setAsyncCallStackDepth({ maxDepth });
             } catch (e) {
                 // Not supported by older runtimes, ignore it.
                 return;
-            }
+            }*/
         } else {
             return Promise.resolve();
         }
@@ -613,11 +620,14 @@ export abstract class ChromeDebugAdapter implements IDebugAdapter {
     private async detectColumnBreakpointSupport(scriptId: Crdp.Runtime.ScriptId): Promise<void> {
         this._columnBreakpointsEnabled = false; // So it isn't requested multiple times
         try {
-            await this.chrome.Debugger.getPossibleBreakpoints({
+            // Due to a bug getPossibleBreakpoints does not work for certain requests, so commenting this out temporarily and enabling column breakpoints by default
+            // This is fixed by this PR: https://microsoft.visualstudio.com/_git/os/pullrequest/1224331
+            // We should uncoment this when we have the latest bits
+            /*await this.chrome.Debugger.getPossibleBreakpoints({
                 start: { scriptId, lineNumber: 0, columnNumber: 0 },
                 end: { scriptId, lineNumber: 1, columnNumber: 0 },
                 restrictToFunction: false
-            });
+            });*/
             this._columnBreakpointsEnabled = true;
         } catch (e) {
             this._columnBreakpointsEnabled = false;

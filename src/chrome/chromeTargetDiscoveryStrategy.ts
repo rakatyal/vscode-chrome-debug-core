@@ -53,7 +53,9 @@ export class ChromeTargetDiscovery implements ITargetDiscoveryStrategy {
     };
 
     private _getTargets(address: string, port: number): Promise<ITarget[]> {
-        const url = `http://${address}:${port}/json`;
+        // Url to get targets for Edge is json/list
+        //const url = `http://${address}:${port}/json`;
+        const url = `http://${address}:${port}/json/list`;
         this.logger.log(`Discovering targets via ${url}`);
         return utils.getURL(url).then<ITarget[]>(jsonResponse => {
             try {
